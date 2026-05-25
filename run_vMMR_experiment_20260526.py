@@ -18,6 +18,7 @@
 # =============================================================================
 
 from psychopy import visual, core, gui, logging
+from psychopy import event as psychopy_event
 from psychopy.hardware import keyboard
 
 # psychopy.parallel may be unavailable on machines with no parallel port
@@ -32,7 +33,7 @@ from datetime import datetime
 import traceback
 import csv
 import random
-
+import unicodedata
 
 # =============================================================================
 # 1. CONSTANTS  -- all timings come straight from the paper's Methods section
@@ -62,8 +63,12 @@ FACE_SIZE   = (425, 405)   # matches the paper's face images
 PRIME_Y     = 260          # prime word sits above the face
 TEXT_HEIGHT = 34
 FIX_HEIGHT  = 42
-TEXT_FONT   = "Arial"      # must contain Hebrew glyphs incl. niqqud (Arial does on Windows)
-
+# TEXT_FONT   = "Arial"      # must contain Hebrew glyphs incl. niqqud (Arial does on Windows)
+# TEXT_FONT = "Tahoma"
+# TEXT_FONT = "Narkisim"
+# TEXT_FONT = "Miriam"
+# TEXT_FONT = "Segoe UI"
+TEXT_FONT = "Noto Sans Hebrew"
 
 # =============================================================================
 # 2. EEG TRIGGER CODES
@@ -134,6 +139,35 @@ def resolve_path(root, path_string):
     p = Path(str(path_string))
     return p if p.is_absolute() else (root / p)
 
+def clean_hebrew_for_display(value):
+    """
+    Clean Hebrew words before sending them to PsychoPy's text renderer.
+
+    Keeps the original CSV word unchanged in the output files, but removes
+    characters that can break rendering or appear as boxes.
+    """
+    s = str(value).strip()
+
+    # Remove invisible direction/control characters sometimes present in Hebrew CSVs
+    control_chars = [
+        "\ufeff",  # BOM
+        "\u200e",  # left-to-right mark
+        "\u200f",  # right-to-left mark
+        "\u202a",  # left-to-right embedding
+        "\u202b",  # right-to-left embedding
+        "\u202c",  # pop directional formatting
+        "\u202d",  # left-to-right override
+        "\u202e",  # right-to-left override
+    ]
+    for ch in control_chars:
+        s = s.replace(ch, "")
+
+    # Remove Hebrew niqqud / combining marks.
+    # This is safest for experimental display unless you explicitly need niqqud.
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+
+    return s.strip()
 
 def sort_block_value(x):
     """Sort key for block labels: numeric where possible, else alphabetical."""
@@ -315,19 +349,35 @@ def write_frame_intervals(win, path):
 # =============================================================================
 # 9. KEYPRESS COLLECTION  -- continuous, trial-level
 # =============================================================================
+def check_escape():
+    """
+    Robust emergency escape check.
 
+    Uses psychopy.event as a fallback because keyboard.Keyboard can sometimes
+    miss ESC depending on focus/backend on Windows.
+    """
+    if psychopy_event.getKeys(keyList=[QUIT_KEY]):
+        raise KeyboardInterrupt("Experiment aborted with ESCAPE.")
+    
 def collect_presses(kb, presses):
-    """Drain the keyboard buffer once. Each response key is appended to
-    `presses` as (name, rt), where rt is on the keyboard clock that was reset
-    at the start of the current trial. ESC raises to abort the experiment."""
-    keys = kb.getKeys(keyList=RESPONSE_KEYS + [QUIT_KEY],
-                      waitRelease=False, clear=True)
+    """
+    Drain the keyboard buffer once. Each response key is appended to `presses`
+    as (name, rt), where rt is on the keyboard clock that was reset at the start
+    of the current trial. ESC raises to abort the experiment.
+    """
+    check_escape()
+
+    keys = kb.getKeys(
+        keyList=RESPONSE_KEYS + [QUIT_KEY],
+        waitRelease=False,
+        clear=True
+    )
+
     for k in keys:
         if k.name == QUIT_KEY:
             raise KeyboardInterrupt("Experiment aborted with ESCAPE.")
         if k.name in RESPONSE_KEYS:
-            presses.append((k.name, k.rt))   # k.rt is relative to trial start
-
+            presses.append((k.name, k.rt))
 
 # =============================================================================
 # 10. DISPLAY HELPERS
@@ -335,19 +385,28 @@ def collect_presses(kb, presses):
 
 def show_text_and_wait(win, kb, text_stim, message,
                         allowed_keys=("space",), min_wait=0.20):
-    """Show a static message until an allowed key is pressed. Used for
-    instructions / rest screens. `min_wait` blocks an accidental instant skip."""
-    text_stim.text = message                 # set once (not every frame)
+    """Show a static message until an allowed key is pressed."""
+    text_stim.text = message
     kb.clearEvents()
+    psychopy_event.clearEvents()
     wait_clock = core.Clock()
+
     while True:
         text_stim.draw()
         win.flip()
-        keys = kb.getKeys(keyList=list(allowed_keys) + [QUIT_KEY],
-                          waitRelease=False, clear=True)
+
+        check_escape()
+
+        keys = kb.getKeys(
+            keyList=list(allowed_keys) + [QUIT_KEY],
+            waitRelease=False,
+            clear=True
+        )
+
         for k in keys:
             if k.name == QUIT_KEY:
                 raise KeyboardInterrupt("Experiment aborted with ESCAPE.")
+
         if wait_clock.getTime() >= min_wait:
             for k in keys:
                 if k.name in allowed_keys:
@@ -467,6 +526,7 @@ def run_trial(row, phase, participant, session, trial_global,
     # Reset the keyboard clock so every keypress rt is measured from trial start;
     # clear any stale presses left over from the previous trial.
     kb.clearEvents()
+    psychopy_event.clearEvents()
     kb.clock.reset()
     presses = []                              # (name, rt) collected all trial
 
@@ -476,7 +536,7 @@ def run_trial(row, phase, participant, session, trial_global,
 
     # Persistent prime word: set the text once; it stays visible from the prime
     # period until the end of the trial.
-    prime_stim.text = word
+    prime_stim.text = clean_hebrew_for_display(word)
 
     # --- 1) trial-start fixation: cross only, jittered 500-700 ms ------------
     fix_frames = max(1, int(round(random.uniform(FIX_MIN, FIX_MAX)
@@ -492,9 +552,9 @@ def run_trial(row, phase, participant, session, trial_global,
 
     # --- 4) the face sequence ------------------------------------------------
     target_onset = None
-    for event_index, event in enumerate(sequence, start=1):
-        role        = event["role"]
-        image_path  = event["image"]
+    for event_index, face_event in enumerate(sequence, start=1):
+        role        = face_event["role"]
+        image_path  = face_event["image"]
         trig_code   = TRIGGER_MAP[(prime_type, identity, role)]
         image_stim  = image_stims[image_path]
 
@@ -650,11 +710,24 @@ def main():
                                            height=TEXT_HEIGHT, color="white",
                                            font=TEXT_FONT, wrapWidth=1000,
                                            units="pix")
-        # Hebrew prime word: languageStyle="RTL" gives correct right-to-left order.
-        prime_stim = visual.TextStim(win, text="", pos=(0, PRIME_Y),
-                                     height=TEXT_HEIGHT, color="white",
-                                     font=TEXT_FONT, languageStyle="RTL",
-                                     units="pix")
+        # Hebrew prime word. The legacy TextStim renderer on Windows crashes on
+        # Hebrew letters that carry niqqud (base letter + combining vowel mark).
+        # TextBox2 has a proper Unicode/RTL renderer and handles this correctly.
+        # Note the API differences: letterHeight (not height), and an explicit
+        # box size + anchor/alignment to keep the word centred at PRIME_Y.
+        prime_stim = visual.TextBox2(win, text="", font=TEXT_FONT,
+                                     pos=(0, PRIME_Y), letterHeight=TEXT_HEIGHT,
+                                     color="white", units="pix",
+                                     size=(1000, 100),
+                                     alignment="center", anchor="center",
+                                     borderColor=None, fillColor=None,
+                                     languageStyle="RTL", editable=False)
+        # --- temporary Hebrew rendering test ----------------------------------------
+        # prime_stim.text = clean_hebrew_for_display("בְּרֵאשִׁית")
+        # prime_stim.draw()
+        # win.flip()
+        # core.wait(2.0)
+        
         fix_stim = visual.TextStim(win, text="+", pos=(0, 0), height=FIX_HEIGHT,
                                    color="white", font=TEXT_FONT, units="pix")
 
