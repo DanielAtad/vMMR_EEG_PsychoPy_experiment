@@ -63,6 +63,22 @@ TEXT_FONT   = "Arial"      # must contain Hebrew glyphs incl. niqqud (Arial does
 # TEXT_FONT = "Segoe UI"
 # TEXT_FONT = "Gisha"
 
+# --- Photodiode timing marker -----------------------------------------------
+# The square is only a visible luminance event on the monitor. The external
+# GTEC-0270 optical sensor and GTEC-0274W g.TRIGbox convert this light change
+# into a TTL trigger for g.HIamp; PsychoPy does not control that hardware.
+DIODE_SIZE      = 100
+DIODE_MARGIN    = 40
+DIODE_CORNER    = "bottom_right"
+DIODE_COLOR_ON  = "white"
+
+PHOTODIODE_TEST_FLASHES = 100
+PHOTODIODE_TEST_TRIGGER = 99
+PHOTODIODE_HARDWARE_CHAIN = (
+    "GTEC-0270 optical sensor -> GTEC-0274W g.TRIGbox -> "
+    "GTEC-0274TR adapter -> g.HIamp DIGITAL IN"
+)
+
 # =============================================================================
 # 2. EEG TRIGGER CODES
 # =============================================================================
@@ -358,6 +374,27 @@ def collect_presses(kb, presses, trigger=None):
 # 10. DISPLAY HELPERS
 # =============================================================================
 
+def make_diode_stim(win, size=100, margin=40, corner="bottom_right"):
+    """Return a photodiode square positioned in the requested screen corner."""
+    corner = str(corner).strip().lower()
+    if corner not in ("bottom_right", "top_right", "bottom_left", "top_left"):
+        raise ValueError(f"Unsupported photodiode corner: {corner!r}")
+
+    if corner.endswith("right"):
+        x = win.size[0] / 2 - margin - size / 2
+    else:
+        x = -win.size[0] / 2 + margin + size / 2
+
+    if corner.startswith("top"):
+        y = win.size[1] / 2 - margin - size / 2
+    else:
+        y = -win.size[1] / 2 + margin + size / 2
+
+    return visual.Rect(win, width=size, height=size, pos=(x, y),
+                       fillColor=DIODE_COLOR_ON, lineColor=DIODE_COLOR_ON,
+                       units="pix")
+
+
 def show_text_and_wait(win, kb, text_stim, message,
                         allowed_keys=("space",), min_wait=0.20):
     """Show a static message until an allowed key is pressed."""
@@ -429,6 +466,9 @@ def present_face_event(win, kb, prime_stim, image_stim, diode_stim,
             onset["trial"] = kb.clock.getTime()
 
     # ----- face ON (prime + face) --------------------------------------------
+    # If enabled, the photodiode square appears on the exact same flip as the
+    # face. The ordinary PsychoPy/LSL trigger remains the condition label; the
+    # optical channel should be used later to align EEG to true visual onset.
     for frame_n in range(face_on_frames):
         prime_stim.draw()
         image_stim.draw()
@@ -449,6 +489,79 @@ def present_face_event(win, kb, prime_stim, image_stim, diode_stim,
         collect_presses(kb, presses, trigger)
 
     return onset["global"], onset["trial"]
+
+
+def run_photodiode_test(win, kb, trigger, diode_stim, frame_counts, base_path):
+    """Flash the diode square 100 times, then return before the experiment.
+
+    The g.TRIGbox is external hardware: this routine only creates the visible
+    luminance events that the GTEC-0270 sensor detects. The optional software
+    marker is useful for measuring software-trigger-to-optical-trigger delay.
+    """
+    if diode_stim is None:
+        raise ValueError("Photodiode test mode requires a diode stimulus.")
+
+    out_path = Path(str(base_path) + "_photodiode_test.csv")
+    fields = [
+        "flash_index",
+        "psychopy_onset_time",
+        "onsetTime",
+        "trigger_code",
+        "triggerCode",
+        "intended_on_duration",
+        "intended_blank_duration",
+    ]
+
+    def _check_abort():
+        check_escape()
+        keys = kb.getKeys(keyList=[QUIT_KEY], waitRelease=False, clear=True)
+        for k in keys:
+            if k.name == QUIT_KEY:
+                raise KeyboardInterrupt("Photodiode test aborted with ESCAPE.")
+
+    def _black_frames(n_frames):
+        for _ in range(n_frames):
+            win.flip()
+            _check_abort()
+
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+
+        kb.clearEvents()
+        psychopy_event.clearEvents()
+
+        # Start from a stable black screen so the first optical pulse is clean.
+        _black_frames(max(1, int(round(1.0 * frame_counts["rate"]))))
+
+        for flash_index in range(1, PHOTODIODE_TEST_FLASHES + 1):
+            onset = {"time": None}
+
+            def _capture_onset():
+                onset["time"] = logging.defaultClock.getTime()
+
+            for frame_n in range(frame_counts["face_on"]):
+                diode_stim.draw()
+                if frame_n == 0:
+                    win.callOnFlip(trigger.set, PHOTODIODE_TEST_TRIGGER)
+                    win.callOnFlip(_capture_onset)
+                if frame_n == 1:
+                    win.callOnFlip(trigger.clear)
+                win.flip()
+                _check_abort()
+
+            _black_frames(frame_counts["blank"])
+
+            writer.writerow({
+                "flash_index": flash_index,
+                "psychopy_onset_time": onset["time"],
+                "onsetTime": onset["time"],
+                "trigger_code": PHOTODIODE_TEST_TRIGGER,
+                "triggerCode": PHOTODIODE_TEST_TRIGGER,
+                "intended_on_duration": FACE_ON_DUR,
+                "intended_blank_duration": FACE_BLANK_DUR,
+            })
+            f.flush()
 
 
 # =============================================================================
@@ -612,10 +725,12 @@ def main():
         "fullscreen": False,
         "send_LSL_triggers": False,
         "photodiode_square": False,
+        "photodiode_test_mode": False,
     }
     dlg = gui.DlgFromDict(exp_info, title="vMMR EEG experiment",
                           order=["participant", "session", "fullscreen",
-                                 "send_LSL_triggers", "photodiode_square"])
+                                 "send_LSL_triggers", "photodiode_square",
+                                 "photodiode_test_mode"])
     if not dlg.OK:
         core.quit()
 
@@ -623,7 +738,9 @@ def main():
     session           = exp_info["session"]
     fullscreen        = bool(exp_info["fullscreen"])
     send_lsl_triggers = bool(exp_info["send_LSL_triggers"])
-    use_photodiode    = bool(exp_info["photodiode_square"])
+    use_photodiode_square = bool(exp_info["photodiode_square"])
+    photodiode_test_mode  = bool(exp_info["photodiode_test_mode"])
+    send_experiment_end_marker = not photodiode_test_mode
 
     # --- output file names ---------------------------------------------------
     stamp     = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -686,7 +803,16 @@ def main():
             for k, v in frame_counts.items():
                 f.write(f"frames[{k}]: {v}\n")
             f.write(f"send_LSL_triggers: {send_lsl_triggers}\n")
-            f.write(f"photodiode_square: {use_photodiode}\n")
+            f.write(f"photodiode_square: {use_photodiode_square}\n")
+            f.write(f"photodiode_square_enabled: {use_photodiode_square}\n")
+            f.write(f"photodiode_square_size_px: {DIODE_SIZE}\n")
+            f.write(f"photodiode_square_corner: {DIODE_CORNER}\n")
+            f.write(f"photodiode_square_margin_px: {DIODE_MARGIN}\n")
+            f.write(f"photodiode_square_color_on: {DIODE_COLOR_ON}\n")
+            f.write(f"photodiode_test_mode: {photodiode_test_mode}\n")
+            f.write(f"photodiode_test_flashes: {PHOTODIODE_TEST_FLASHES}\n")
+            f.write(f"photodiode_test_trigger: {PHOTODIODE_TEST_TRIGGER}\n")
+            f.write(f"photodiode_hardware_chain: {PHOTODIODE_HARDWARE_CHAIN}\n")
 
         # --- stimuli --------------------------------------------------------
         image_stims = preload_images(win, root, all_rows)
@@ -717,12 +843,17 @@ def main():
                                    color="white", font=TEXT_FONT, units="pix")
 
         diode_stim = None
-        if use_photodiode:
-            diode_stim = visual.Rect(win, width=40, height=40,
-                                     pos=(win.size[0] / 2 - 40,
-                                          win.size[1] / 2 - 40),
-                                     fillColor="white", lineColor="white",
-                                     units="pix")
+        if use_photodiode_square or photodiode_test_mode:
+            diode_stim = make_diode_stim(
+                win,
+                size=DIODE_SIZE,
+                margin=DIODE_MARGIN,
+                corner=DIODE_CORNER,
+            )
+
+        if photodiode_test_mode:
+            run_photodiode_test(win, kb, trigger, diode_stim, frame_counts, base)
+            return
 
         # --- instructions ----------------------------------------------------
         show_text_and_wait(win, kb, instruction_text,
@@ -790,7 +921,8 @@ def main():
         # Log the full traceback so an unexpected crash is diagnosable.
         logging.error(f"Unexpected error: {e}\n{traceback.format_exc()}")
     finally:
-        trigger.set(99)    # experiment end — always fires, even on crash/abort
+        if send_experiment_end_marker:
+            trigger.set(99)    # experiment end — always fires on real runs
         trigger.clear()
         trigger.stop()
         if win is not None:

@@ -1,2 +1,4 @@
 data/*
 !data/.gitkeep
+stimuli/.DS_Store
+.DS_Store
