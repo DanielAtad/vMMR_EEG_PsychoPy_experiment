@@ -172,6 +172,7 @@ A startup dialog will appear with these fields:
 participant
 session
 fullscreen
+expected_refresh_hz
 send_LSL_triggers
 parallel_port_address
 photodiode_square
@@ -187,6 +188,7 @@ For the first dry run, use:
 participant: test001
 session: 001
 fullscreen: unchecked
+expected_refresh_hz: 60
 send_LSL_triggers: unchecked
 parallel_port_address: 0x0378
 photodiode_square: unchecked
@@ -200,6 +202,7 @@ For EEG testing, use:
 
 ```text
 fullscreen: checked
+expected_refresh_hz: 60 or 120, matching the monitor mode
 send_LSL_triggers: checked
 parallel_port_address: 0x0378
 photodiode_square: checked if using photodiode validation
@@ -210,6 +213,25 @@ lsl_nominal_srate: 1200
 ```
 
 Do not enable LSL triggers until the lab acquisition setup has been confirmed.
+
+`expected_refresh_hz` accepts only `60` or `120`. PsychoPy measures the display
+after opening the window and aborts before practice if the measured rate differs
+from the expected rate by more than 2%. Common fractional rates such as 59.94 Hz
+and 119.88 Hz are accepted. If PsychoPy cannot measure the display, the run log
+contains a prominent warning and the configured expected rate is used; it is not
+reported as a successful measurement.
+
+All stimulus frame counts use the configured expected rate. The measured rate,
+when available and valid, is used only to set the dropped-frame threshold.
+
+| Task duration | 60 Hz | 120 Hz |
+| --- | ---: | ---: |
+| Fixation minimum, 500 ms | 30 frames | 60 frames |
+| Fixation maximum, 700 ms | 42 frames | 84 frames |
+| Prime / face SOA, 600 ms | 36 frames | 72 frames |
+| Pre-face fixation / face on, 250 ms | 15 frames | 30 frames |
+| Face blank, 350 ms | 21 frames | 42 frames |
+| Post-sequence response capture, 500 ms | 30 frames | 60 frames |
 
 ## Response key
 
@@ -242,7 +264,20 @@ Trigger codes:
 
 Triggers are sent using `win.callOnFlip(...)`, so they are aligned with the screen flip on which the face appears.
 
-The trigger is cleared one frame later.
+The LSL stream is a continuous latched state channel for the current Simulink
+receiver, not an irregular event stream. A nonzero marker is repeated for the
+configured `hold_duration` (100 ms by default) and then automatically returns
+to zero. Detect events offline from transitions into a nonzero value. The
+parallel-port backend still clears its pulse one display frame later; the LSL
+backend does not.
+
+The marker code supplies the intended event/condition identity. The photodiode
+channel remains the measurement of physical visual onset. LSL keepalive and
+nominal sampling rates are independent of monitor refresh rate.
+
+When supported by the installed `pylsl`, startup waits up to 15 seconds for the
+Simulink inlet and aborts safely if none connects. Older `pylsl` versions retain
+the manual “start Simulink, then press Enter” workflow.
 
 ## Photodiode / optical timing validation
 
@@ -267,7 +302,7 @@ correct visual-onset delay/jitter.
 The square defaults to:
 
 ```text
-size: 100 x 100 px
+size: 45 x 45 px
 corner: bottom_right
 margin: 40 px
 color: white
@@ -303,6 +338,7 @@ send_LSL_triggers: checked
 photodiode_square: either checked or unchecked
 photodiode_test_mode: unchecked
 lsl_buffer_test_mode: checked
+expected_refresh_hz: 60 or 120, matching the monitor mode
 lsl_keepalive_hz: 1200
 lsl_nominal_srate: 1200
 ```
@@ -314,7 +350,7 @@ experiment-start marker: 9, sent before the black baseline
 white square on: 250 ms
 black screen off: 750 ms
 marker codes: 101, 102, ..., 200
-square: 120 x 120 px, bottom_right, 80 px margin
+square: 45 x 45 px, bottom_right, 40 px margin
 ```
 
 Each LSL marker is sent on the same `win.flip()` that draws the square. The
@@ -331,10 +367,19 @@ flash_index
 marker_code
 psychopy_global_onset_time
 lsl_push_timestamp
+psychopy_flip_timestamp
+lsl_event_timestamp
+expected_refresh_hz
+measured_refresh_hz
 frame_rate
 on_frames
 off_frames
 ```
+
+`psychopy_flip_timestamp` is recorded before the LSL push callback runs, and
+`lsl_event_timestamp` is the exact `pylsl.local_clock()` timestamp attached to
+the event sample. These clocks may have different origins; do not subtract the
+two columns directly unless they have first been mapped to a common clock.
 
 Compare the PsychoPy CSV, Simulink LSL markers `101`-`200`, and the g.HIamp
 photodiode channel. If PsychoPy reports that the LSL marker was pushed on the
@@ -456,8 +501,13 @@ participant
 session
 timestamp
 measured frame rate
+expected refresh rate
+refresh measurement success and expected/measured difference
+dropped-frame threshold
 frame counts for each task period
+intended and realized duration for each frame count
 LSL trigger setting
+LSL keepalive, nominal sampling rate, hold duration, and manual-clear setting
 photodiode_square_enabled
 photodiode_square_size_px
 photodiode_square_corner
@@ -469,6 +519,44 @@ photodiode_hardware_chain
 ```
 
 ## Recommended dry-run checks
+
+### 60 Hz dry run
+
+1. Set the operating-system display mode to 60 Hz.
+2. Run `run_vMMR_experiment_v0.py` with `expected_refresh_hz: 60`.
+3. For a software-only run, uncheck `send_LSL_triggers`,
+   `photodiode_square`, `photodiode_test_mode`, and `lsl_buffer_test_mode`.
+4. Confirm the run-info file reports 15 face-on frames, 21 blank frames, and a
+   36-frame face SOA.
+
+### 120 Hz dry run
+
+1. Set the operating-system display mode to 120 Hz.
+2. Run `run_vMMR_experiment_v0.py` with `expected_refresh_hz: 120`.
+3. Use the same software-only settings as the 60 Hz dry run.
+4. Confirm the run-info file reports 30 face-on frames, 42 blank frames, and a
+   72-frame face SOA.
+
+### Photodiode test
+
+Run `run_vMMR_experiment_v0.py` with the correct `expected_refresh_hz`, check
+`photodiode_test_mode`, and check `send_LSL_triggers` when comparing the
+software marker with the optical channel. Place the GTEC-0270 sensor on the
+bottom-right square before the flashes begin. The mode writes
+`*_photodiode_test.csv` and exits before practice.
+
+### LSL buffering test
+
+Start the Simulink model, then run `run_vMMR_experiment_v0.py` with the correct
+`expected_refresh_hz`, `send_LSL_triggers`, and `lsl_buffer_test_mode` checked;
+leave `photodiode_test_mode` unchecked. Place the optical sensor on the
+bottom-right square. The mode writes `*_lsl_buffer_test.csv` and exits before
+loading the trial tables.
+
+For both monitor modes, inspect `*_frame_intervals.csv` for dropped frames and
+confirm in the acquired data that each LSL code remains nonzero for about
+100 ms, returns to zero before the next 600 ms face onset, and final marker `99`
+is recorded before the stream shuts down.
 
 After the first full dummy run, check:
 

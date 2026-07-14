@@ -90,6 +90,11 @@ import random
 import csv
 
 from lsl_trigger import LSLTrigger
+from timing_utils import (
+    parse_expected_refresh_hz,
+    refresh_rate_diagnostics,
+    seconds_to_frames,
+)
 
 # =============================================================================
 # 1. CONSTANTS
@@ -287,9 +292,12 @@ def run_flash(win, kb, trigger, diode_stim, frame_counts,
 
     onset = {"lsl": None, "psy": None}
 
-    def _push():
-        onset["psy"] = logging.defaultClock.getTime()
+    def _push_lsl():
         onset["lsl"] = trigger.set_with_timestamp(marker_code)
+
+    def _capture_and_push():
+        onset["psy"] = logging.defaultClock.getTime()
+        _push_lsl()
 
     dropped_before = win.nDroppedFrames
     requested_flip_time = None
@@ -301,12 +309,14 @@ def run_flash(win, kb, trigger, diode_stim, frame_counts,
         if frame_n == 0:
             requested_flip_time = logging.defaultClock.getTime()
             if scheduling == "ON_FLIP":
-                win.callOnFlip(_push)          # fires inside flip(), post-swap
+                # Record the flip timestamp before the LSL outlet call.
+                win.timeOnFlip(onset, "psy")
+                win.callOnFlip(_push_lsl)       # fires inside flip(), post-swap
             elif scheduling == "PRE_FLIP":
-                _push()                        # pushed before the swap
+                _capture_and_push()            # pushed before the swap
             actual_flip_time = win.flip()
             if scheduling == "POST_FLIP":
-                _push()                        # pushed after the swap returns
+                _capture_and_push()            # pushed after the swap returns
         else:
             win.flip()
         check_abort(kb)
@@ -331,6 +341,8 @@ def run_flash(win, kb, trigger, diode_stim, frame_counts,
         "push_minus_flip": push_minus_flip,
         "dropped_frames_delta": dropped_after - dropped_before,
         "frame_rate": frame_counts["rate"],
+        "expected_refresh_hz": frame_counts["expected_rate"],
+        "measured_refresh_hz": frame_counts["measured_rate"],
         "on_frames": frame_counts["on"],
         "off_frames": frame_counts["off"],
         "intended_on_duration": ON_DUR,
@@ -503,14 +515,11 @@ def run_latency_block(win, kb, trigger, text_stim, frame_counts, writer, f, meta
 # 8. THRESHOLD-TUNING MODE
 # =============================================================================
 
-def run_threshold_tuning(win, kb, trigger, frame_rate):
+def run_threshold_tuning(win, kb, trigger, frame_counts):
     """Flash a large full-white patch repeatedly so the operator can adjust the
     g.TRIGbox sensitivity until its LED tracks every ON/OFF cycle reliably."""
-    def n_frames(s):
-        return max(1, int(round(s * frame_rate)))
-
-    on_frames  = n_frames(TUNING_ON_DUR)
-    off_frames = n_frames(TUNING_OFF_DUR)
+    on_frames = frame_counts["tuning_on"]
+    off_frames = frame_counts["tuning_off"]
 
     x, y = diode_xy(win, DIODE_SIZE_DIAGNOSTIC, DIODE_MARGIN, h="right", v="bottom")
     diode_stim = visual.Rect(win, width=DIODE_SIZE_DIAGNOSTIC, height=DIODE_SIZE_DIAGNOSTIC,
@@ -597,6 +606,7 @@ def main():
         "participant": "timing",
         "session": "001",
         "fullscreen": True,
+        "expected_refresh_hz": "60",
         "send_LSL_triggers": True,
         "threshold_tuning_mode": False,
         "latency_only_mode": False,
@@ -609,7 +619,8 @@ def main():
     }
     dlg = gui.DlgFromDict(
         exp_info, title="vMMR timing decomposition",
-        order=["participant", "session", "fullscreen", "send_LSL_triggers",
+        order=["participant", "session", "fullscreen", "expected_refresh_hz",
+               "send_LSL_triggers",
                "threshold_tuning_mode", "latency_only_mode",
                "run_position_blocks", "run_cadence_block",
                "reps_per_cell", "rng_seed", "lsl_keepalive_hz", "lsl_nominal_srate"])
@@ -619,6 +630,16 @@ def main():
     participant           = exp_info["participant"]
     session               = exp_info["session"]
     fullscreen            = bool(exp_info["fullscreen"])
+    try:
+        expected_refresh_hz = parse_expected_refresh_hz(
+            exp_info["expected_refresh_hz"]
+        )
+    except ValueError as exc:
+        error_dlg = gui.Dlg(title="Invalid refresh rate")
+        error_dlg.addText(str(exc))
+        error_dlg.show()
+        core.quit()
+        return
     send_lsl_triggers     = bool(exp_info["send_LSL_triggers"])
     threshold_tuning_mode = bool(exp_info["threshold_tuning_mode"])
     latency_only_mode     = bool(exp_info["latency_only_mode"])
@@ -651,6 +672,9 @@ def main():
     win = None
     trigger = None
     flash_f = None
+    lsl_consumer_check_available = None
+    lsl_consumer_connected = None
+    run_exception = None
     try:
         # --- hardware: bring up the outlet, wait for Simulink ----------------
         if send_lsl_triggers:
@@ -658,9 +682,29 @@ def main():
                                  keepalive_hz=lsl_keepalive_hz,
                                  nominal_srate=lsl_nominal_srate)
             print("LSL marker stream 'experiment_markers' created.", flush=True)
-            print("\nOutlet live. Start the Simulink model, "
-                  "then press Enter when ready...", flush=True)
-            input()
+            print("\nOutlet live. Start the Simulink model now.", flush=True)
+            lsl_consumer_connected = trigger.wait_for_consumers(timeout=15.0)
+            lsl_consumer_check_available = lsl_consumer_connected is not None
+            if lsl_consumer_connected is False:
+                message = (
+                    "No Simulink LSL inlet connected to 'experiment_markers' "
+                    "within 15 seconds. The diagnostic will stop."
+                )
+                print(message, flush=True)
+                raise RuntimeError(message)
+            if lsl_consumer_connected is None:
+                logging.warning(
+                    "This pylsl version cannot detect consumers automatically; "
+                    "using the manual Simulink confirmation workflow."
+                )
+                print(
+                    "Automatic LSL consumer detection is unavailable. Start the "
+                    "Simulink model, then press Enter when ready...",
+                    flush=True,
+                )
+                input()
+            else:
+                print("Simulink LSL inlet detected.", flush=True)
         else:
             trigger = LSLTrigger(enabled=False)
 
@@ -674,22 +718,61 @@ def main():
         kb = keyboard.Keyboard()
 
         # --- refresh rate -> frame counts ------------------------------------
-        frame_rate = win.getActualFrameRate(nIdentical=60, nMaxFrames=180,
-                                             nWarmUpFrames=10, threshold=1)
-        if frame_rate is None:
-            frame_rate = 60.0
-            logging.warning("Could not measure refresh rate; assuming 60 Hz.")
-        win.refreshThreshold = (1.0 / frame_rate) * 1.2
+        measured_refresh_hz = win.getActualFrameRate(
+            nIdentical=60, nMaxFrames=180, nWarmUpFrames=10, threshold=1
+        )
+        refresh_diagnostics = refresh_rate_diagnostics(
+            expected_refresh_hz, measured_refresh_hz
+        )
+        if not refresh_diagnostics["measurement_successful"]:
+            logging.warning(
+                "Could not measure monitor refresh rate; using configured "
+                f"expected_refresh_hz={expected_refresh_hz:g}."
+            )
+        elif not refresh_diagnostics["matches_expected"]:
+            message = (
+                "Monitor refresh-rate mismatch. "
+                f"Expected {expected_refresh_hz:.3f} Hz but PsychoPy measured "
+                f"{measured_refresh_hz:.3f} Hz (allowed difference: 2%)."
+            )
+            logging.error(message)
+            print(message, flush=True)
+            error_dlg = gui.Dlg(title="Refresh-rate mismatch")
+            error_dlg.addText(message)
+            error_dlg.show()
+            raise RuntimeError(message)
 
-        def n_frames(seconds):
-            return max(1, int(round(seconds * frame_rate)))
+        threshold_rate = refresh_diagnostics["threshold_rate_hz"]
+        win.refreshThreshold = (1.0 / threshold_rate) * 1.2
+
+        frame_duration_seconds = {
+            "on": ON_DUR,
+            "off": OFF_DUR,
+            "initial_black": INITIAL_BLACK_DUR,
+            "tuning_on": TUNING_ON_DUR,
+            "tuning_off": TUNING_OFF_DUR,
+        }
 
         frame_counts = {
-            "rate": frame_rate,
-            "on": n_frames(ON_DUR),
-            "off": n_frames(OFF_DUR),
-            "initial_black": n_frames(INITIAL_BLACK_DUR),
+            "expected_rate": expected_refresh_hz,
+            "measured_rate": measured_refresh_hz,
+            "rate": expected_refresh_hz,
         }
+        frame_counts.update({
+            name: seconds_to_frames(seconds, expected_refresh_hz)
+            for name, seconds in frame_duration_seconds.items()
+        })
+        if (frame_counts["on"] + frame_counts["off"]
+                != seconds_to_frames(0.600, expected_refresh_hz)):
+            raise RuntimeError(
+                "Timing diagnostic invariant failed: 250 ms on + 350 ms off "
+                "must equal the 600 ms face SOA."
+            )
+
+        meta.update({
+            "expected_refresh_hz": expected_refresh_hz,
+            "measured_refresh_hz": measured_refresh_hz,
+        })
 
         text_stim = visual.TextStim(win, text="", pos=(0, 0), height=30,
                                     color="white", units="pix", wrapWidth=1000)
@@ -698,9 +781,29 @@ def main():
         with open(str(base) + "_run_info.txt", "w", encoding="utf-8") as f:
             f.write(f"participant: {participant}\nsession: {session}\n")
             f.write(f"timestamp: {stamp}\n")
-            f.write(f"frame_rate_measured: {frame_rate}\n")
-            for k, v in frame_counts.items():
-                f.write(f"frames[{k}]: {v}\n")
+            f.write(f"expected_refresh_hz: {expected_refresh_hz}\n")
+            f.write(f"measured_refresh_hz: {measured_refresh_hz}\n")
+            f.write(
+                "refresh_measurement_successful: "
+                f"{str(refresh_diagnostics['measurement_successful']).lower()}\n"
+            )
+            f.write(
+                "refresh_rate_difference_hz: "
+                f"{refresh_diagnostics['difference_hz']}\n"
+            )
+            f.write(
+                "refresh_rate_difference_percent: "
+                f"{refresh_diagnostics['difference_percent']}\n"
+            )
+            f.write(f"dropped_frame_threshold_seconds: {win.refreshThreshold}\n")
+            for name, intended_seconds in frame_duration_seconds.items():
+                frames = frame_counts[name]
+                f.write(f"frames[{name}]: {frames}\n")
+                f.write(f"intended_duration_seconds[{name}]: {intended_seconds}\n")
+                f.write(
+                    f"realized_duration_seconds[{name}]: "
+                    f"{frames / expected_refresh_hz}\n"
+                )
             f.write(f"send_LSL_triggers: {send_lsl_triggers}\n")
             f.write(f"threshold_tuning_mode: {threshold_tuning_mode}\n")
             f.write(f"latency_only_mode: {latency_only_mode}\n")
@@ -740,6 +843,16 @@ def main():
                     f"{CADENCE_MARKER_BASE + 1}–{CADENCE_MARKER_BASE + CADENCE_N})\n")
             f.write(f"lsl_keepalive_hz: {lsl_keepalive_hz}\n")
             f.write(f"lsl_nominal_srate: {lsl_nominal_srate}\n")
+            f.write(f"lsl_hold_duration: {trigger.hold_duration}\n")
+            f.write(
+                "trigger_requires_manual_clear: "
+                f"{trigger.requires_manual_clear}\n"
+            )
+            f.write(
+                "lsl_consumer_check_available: "
+                f"{lsl_consumer_check_available}\n"
+            )
+            f.write(f"lsl_consumer_connected: {lsl_consumer_connected}\n")
 
         # --- start marker ----------------------------------------------------
         if trigger is not None:
@@ -747,9 +860,7 @@ def main():
 
         # --- threshold-tuning shortcut (iterate on knob, then re-run) --------
         if threshold_tuning_mode:
-            run_threshold_tuning(win, kb, trigger, frame_rate)
-            if trigger is not None:
-                trigger.set(END_MARKER)
+            run_threshold_tuning(win, kb, trigger, frame_counts)
             return
 
         # --- latency-only shortcut (single condition, no factorial) ----------
@@ -758,8 +869,6 @@ def main():
                 str(base) + "_timing_decomposition.csv", meta.keys())
             run_latency_block(win, kb, trigger, text_stim, frame_counts,
                               flash_writer, flash_f, meta)
-            if trigger is not None:
-                trigger.set(END_MARKER)
             return
 
         # --- position blocks -------------------------------------------------
@@ -776,10 +885,6 @@ def main():
         if do_cadence_block:
             run_cadence_block(win, kb, trigger, base, meta)
 
-        # --- end marker ------------------------------------------------------
-        if trigger is not None:
-            trigger.set(END_MARKER)
-
         play_notification_beeps()
         text_stim.text = "Timing diagnostic complete.\n\nPress SPACE to exit."
         kb.clearEvents()
@@ -794,19 +899,22 @@ def main():
                 break
 
     except KeyboardInterrupt as e:
+        run_exception = e
         logging.warning(f"Run ended early: {e}")
-        if trigger is not None:
-            trigger.set(END_MARKER)
     except Exception as e:
+        run_exception = e
         logging.error(f"Unexpected error: {e}\n{traceback.format_exc()}")
-        if trigger is not None:
-            trigger.set(END_MARKER)
         play_notification_beeps(n=6, freq=440)  # lower-pitched alarm for errors
     finally:
         if trigger is not None:
-            trigger.clear()
-            if hasattr(trigger, "stop"):
-                trigger.stop()
+            try:
+                trigger.finish(final_code=END_MARKER)
+            except Exception as shutdown_error:
+                logging.error(
+                    "Trigger shutdown failed after run error "
+                    f"{run_exception!r}: {shutdown_error}\n"
+                    f"{traceback.format_exc()}"
+                )
         if win is not None:
             write_frame_intervals(win, str(base) + "_frame_intervals.csv")
             win.close()

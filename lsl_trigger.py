@@ -35,6 +35,10 @@ _HOLD_DURATION = 0.100   # 0 < consumer_period << hold << min_event_gap
 
 class LSLTrigger:
 
+    # LSL is a latched state channel. Its keepalive thread returns the marker to
+    # zero after hold_duration, so display code must not clear it on frame 2.
+    requires_manual_clear = False
+
     def __init__(self, enabled=False, stream_name=_STREAM_NAME,
                  source_id='vmmr_exp', keepalive_hz=_KEEPALIVE_HZ,
                  nominal_srate=_NOMINAL_SRATE, hold_duration=_HOLD_DURATION):
@@ -48,6 +52,9 @@ class LSLTrigger:
         self._expiry = None
         self._stop_event = threading.Event()
         self._keepalive_thread = None
+        self._lifecycle_lock = threading.Lock()
+        self._finished = False
+        self._stopped = False
 
         if not self.enabled:
             return
@@ -86,12 +93,15 @@ class LSLTrigger:
     def set_with_timestamp(self, code):
         if self.outlet is None:
             return None
-        ts = local_clock()
+        value = int(code)
         with self._lock:
-            self._current_value = int(code)
-            self._expiry = ts + self.hold_duration
-            self.outlet.push_sample([int(code)], pushthrough=True)
-        return ts
+            timestamp = local_clock()
+            self._current_value = value
+            self._expiry = timestamp + self.hold_duration
+            self.outlet.push_sample(
+                [value], timestamp=timestamp, pushthrough=True
+            )
+        return timestamp
 
     def set(self, code):
         self.set_with_timestamp(code)
@@ -104,8 +114,51 @@ class LSLTrigger:
             self._expiry = None
             self.outlet.push_sample([0], pushthrough=True)
 
+    def wait_for_consumers(self, timeout=15.0):
+        """Wait for an inlet when supported; return None on older pylsl."""
+        if self.outlet is None:
+            return False
+        wait = getattr(self.outlet, "wait_for_consumers", None)
+        if wait is None:
+            return None
+        return bool(wait(float(timeout)))
+
+    def finish(self, final_code=99, margin=0.050):
+        """Latch a final marker, return to zero, and stop exactly once."""
+        margin = float(margin)
+        if margin < 0:
+            raise ValueError("margin must not be negative.")
+
+        with self._lifecycle_lock:
+            if self._finished or self._stopped:
+                return
+            self._finished = True
+
+        if self.outlet is None:
+            self.stop()
+            return
+
+        try:
+            self.set(final_code)
+            # Keep the outlet and keepalive thread alive for the full latch.
+            self._stop_event.wait(self.hold_duration + margin)
+            self.clear()
+        finally:
+            self.stop()
+
     def stop(self):
-        self._stop_event.set()
-        if self._keepalive_thread is not None:
-            self._keepalive_thread.join(timeout=1.0)
-        self._keepalive_thread = None
+        """Stop and join the keepalive thread; safe to call repeatedly."""
+        with self._lifecycle_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            self._stop_event.set()
+            thread = self._keepalive_thread
+
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+            if thread.is_alive():
+                raise RuntimeError("LSL keepalive thread did not stop cleanly.")
+
+        with self._lifecycle_lock:
+            self._keepalive_thread = None

@@ -42,6 +42,11 @@ import random
 import unicodedata
 
 from lsl_trigger import LSLTrigger
+from timing_utils import (
+    parse_expected_refresh_hz,
+    refresh_rate_diagnostics,
+    seconds_to_frames,
+)
 
 # =============================================================================
 # 1. CONSTANTS  -- all timings come straight from the paper's Methods section
@@ -89,6 +94,7 @@ DIODE_COLOR_ON  = "white"
 
 PHOTODIODE_TEST_FLASHES = 100
 PHOTODIODE_TEST_TRIGGER = 99
+PHOTODIODE_TEST_INITIAL_BLACK_DUR = 1.000
 PHOTODIODE_HARDWARE_CHAIN = (
     "GTEC-0270 optical sensor -> GTEC-0274W g.TRIGbox -> "
     "GTEC-0274TR adapter -> g.HIamp DIGITAL IN"
@@ -304,9 +310,14 @@ class EEGTrigger:
     """Thin wrapper around the parallel port. When disabled, every call is a
     no-op, so the exact same code runs during a no-hardware dry run."""
 
+    requires_manual_clear = True
+
     def __init__(self, enabled=False, address="0x0378"):
         self.enabled = enabled
         self.port = None
+        # A disabled parallel-port backend is a no-op and does not need a
+        # frame-2 callback, while the active backend must return its lines low.
+        self.requires_manual_clear = bool(enabled)
         if not self.enabled:
             return
         if parallel is None:
@@ -521,6 +532,21 @@ def present_static(win, kb, draw_list, n_frames, presses):
         collect_presses(kb, presses)
 
 
+def _send_marker_and_store_lsl_timestamp(trigger, onset, code):
+    """Push a marker after flip timestamps have already been recorded."""
+    if hasattr(trigger, "set_with_timestamp"):
+        onset["lsl"] = trigger.set_with_timestamp(code)
+    else:
+        trigger.set(code)
+        onset["lsl"] = None
+
+
+def _schedule_manual_clear_if_required(win, trigger, frame_n):
+    """Return pulse-style hardware to zero without shortening LSL latches."""
+    if frame_n == 1 and getattr(trigger, "requires_manual_clear", False):
+        win.callOnFlip(trigger.clear)
+
+
 # =============================================================================
 # 11. PRESENT ONE FACE EVENT
 # =============================================================================
@@ -529,7 +555,8 @@ def present_face_event(win, kb, prime_stim, image_stim, diode_stim,
                         role, trigger_code, trigger,
                         face_on_frames, blank_frames, presses):
     """Present one face: prime + face for 250 ms, then prime alone for 350 ms.
-    The EEG trigger is sent on the face-onset flip and cleared one frame later.
+    The trigger is sent on the face-onset flip. Pulse-style hardware is cleared
+    one frame later; the LSL backend remains latched for its hold duration.
     Keypresses are collected throughout (continuous response model).
 
     Returns (onset_global, onset_trialclock):
@@ -537,14 +564,7 @@ def present_face_event(win, kb, prime_stim, image_stim, diode_stim,
       onset_trialclock -- target onset on the trial clock, or None if not a target
     """
     is_target_event = role.startswith("TARGET")
-    onset = {"global": None, "trial": None}
-
-    # callOnFlip runs this the instant the face appears, so the recorded
-    # target onset shares the same clock as every keypress rt.
-    def _capture_onset():
-        onset["global"] = logging.defaultClock.getTime()
-        if is_target_event:
-            onset["trial"] = kb.clock.getTime()
+    onset = {"global": None, "trial": None, "lsl": None}
 
     # ----- face ON (prime + face) --------------------------------------------
     # If enabled, the photodiode square appears on the exact same flip as the
@@ -556,10 +576,18 @@ def present_face_event(win, kb, prime_stim, image_stim, diode_stim,
         if diode_stim is not None:
             diode_stim.draw()              # photodiode square only while face is on
         if frame_n == 0:                   # first frame: arm onset actions
-            win.callOnFlip(trigger.set, trigger_code)
-            win.callOnFlip(_capture_onset)
-        if frame_n == 1:                   # second frame: clear the 1-frame pulse
-            win.callOnFlip(trigger.clear)
+            # Queue timing capture before the LSL push so saved onset values do
+            # not include time waiting for the outlet lock or network call.
+            win.timeOnFlip(onset, "global")
+            if is_target_event:
+                win.callOnFlip(
+                    lambda: onset.__setitem__("trial", kb.clock.getTime())
+                )
+            win.callOnFlip(
+                _send_marker_and_store_lsl_timestamp,
+                trigger, onset, trigger_code,
+            )
+        _schedule_manual_clear_if_required(win, trigger, frame_n)
         win.flip()
         collect_presses(kb, presses)
 
@@ -613,21 +641,20 @@ def run_photodiode_test(win, kb, trigger, diode_stim, frame_counts, base_path):
         psychopy_event.clearEvents()
 
         # Start from a stable black screen so the first optical pulse is clean.
-        _black_frames(max(1, int(round(1.0 * frame_counts["rate"]))))
+        _black_frames(frame_counts["photodiode_initial_black"])
 
         for flash_index in range(1, PHOTODIODE_TEST_FLASHES + 1):
-            onset = {"time": None}
-
-            def _capture_onset():
-                onset["time"] = logging.defaultClock.getTime()
+            onset = {"global": None, "lsl": None}
 
             for frame_n in range(frame_counts["face_on"]):
                 diode_stim.draw()
                 if frame_n == 0:
-                    win.callOnFlip(trigger.set, PHOTODIODE_TEST_TRIGGER)
-                    win.callOnFlip(_capture_onset)
-                if frame_n == 1:
-                    win.callOnFlip(trigger.clear)
+                    win.timeOnFlip(onset, "global")
+                    win.callOnFlip(
+                        _send_marker_and_store_lsl_timestamp,
+                        trigger, onset, PHOTODIODE_TEST_TRIGGER,
+                    )
+                _schedule_manual_clear_if_required(win, trigger, frame_n)
                 win.flip()
                 _check_abort()
 
@@ -635,8 +662,8 @@ def run_photodiode_test(win, kb, trigger, diode_stim, frame_counts, base_path):
 
             writer.writerow({
                 "flash_index": flash_index,
-                "psychopy_onset_time": onset["time"],
-                "onsetTime": onset["time"],
+                "psychopy_onset_time": onset["global"],
+                "onsetTime": onset["global"],
                 "trigger_code": PHOTODIODE_TEST_TRIGGER,
                 "triggerCode": PHOTODIODE_TEST_TRIGGER,
                 "intended_on_duration": FACE_ON_DUR,
@@ -665,13 +692,19 @@ def run_lsl_buffer_test(win, kb, trigger, frame_counts, base_path):
     fields = [
         "flash_index",
         "marker_code",
+        "psychopy_flip_timestamp",
         "psychopy_global_onset_time",
+        "lsl_event_timestamp",
         "lsl_push_timestamp",
+        "expected_refresh_hz",
+        "measured_refresh_hz",
         "intended_on_duration",
         "intended_off_duration",
+        "intended_initial_black_duration",
         "frame_rate",
         "on_frames",
         "off_frames",
+        "initial_black_frames",
         "notes",
     ]
 
@@ -699,24 +732,20 @@ def run_lsl_buffer_test(win, kb, trigger, frame_counts, base_path):
 
         for flash_index in range(1, LSL_BUFFER_TEST_FLASHES + 1):
             marker_code = LSL_BUFFER_TEST_MARKER_BASE + flash_index
-            onset = {"psychopy": None, "lsl": None}
+            onset = {"global": None, "lsl": None}
 
-            def _send_marker_and_capture(code=marker_code):
-                onset["psychopy"] = logging.defaultClock.getTime()
-                if hasattr(trigger, "set_with_timestamp"):
-                    onset["lsl"] = trigger.set_with_timestamp(code)
-                else:
-                    trigger.set(code)
-                    onset["lsl"] = None
-
-            # Identical to present_face_event: send trigger at frame 0,
-            # clear at frame 1 (1-frame pulse).  Keepalive continues running.
+            # Identical to present_face_event: capture the flip timestamp first,
+            # then push the marker. LSL auto-expires; pulse hardware clears on
+            # frame 2 only when its backend requests that behavior.
             for frame_n in range(on_frames):
                 diode_stim.draw()
                 if frame_n == 0:
-                    win.callOnFlip(_send_marker_and_capture)
-                if frame_n == 1:
-                    win.callOnFlip(trigger.clear)
+                    win.timeOnFlip(onset, "global")
+                    win.callOnFlip(
+                        _send_marker_and_store_lsl_timestamp,
+                        trigger, onset, marker_code,
+                    )
+                _schedule_manual_clear_if_required(win, trigger, frame_n)
                 win.flip()
                 _check_abort()
 
@@ -725,14 +754,25 @@ def run_lsl_buffer_test(win, kb, trigger, frame_counts, base_path):
             writer.writerow({
                 "flash_index": flash_index,
                 "marker_code": marker_code,
-                "psychopy_global_onset_time": onset["psychopy"],
+                "psychopy_flip_timestamp": onset["global"],
+                "psychopy_global_onset_time": onset["global"],
+                "lsl_event_timestamp": onset["lsl"],
                 "lsl_push_timestamp": onset["lsl"],
+                "expected_refresh_hz": frame_counts["expected_rate"],
+                "measured_refresh_hz": frame_counts["measured_rate"],
                 "intended_on_duration": LSL_BUFFER_TEST_ON_DUR,
                 "intended_off_duration": LSL_BUFFER_TEST_OFF_DUR,
+                "intended_initial_black_duration": (
+                    LSL_BUFFER_TEST_INITIAL_BLACK_DUR
+                ),
                 "frame_rate": frame_counts["rate"],
                 "on_frames": on_frames,
                 "off_frames": off_frames,
-                "notes": "marker and square scheduled on same flip",
+                "initial_black_frames": initial_black_frames,
+                "notes": (
+                    "marker and square scheduled on same flip; PsychoPy and "
+                    "LSL timestamps are not directly subtracted"
+                ),
             })
             f.flush()
 
@@ -805,8 +845,10 @@ def run_trial(row, phase, participant, session, trial_global,
     prime_stim.text = clean_hebrew_for_display(word)
 
     # --- 1) trial-start fixation: cross only, jittered 500-700 ms ------------
-    fix_frames = max(1, int(round(random.uniform(FIX_MIN, FIX_MAX)
-                                  * frame_counts["rate"])))
+    requested_fix_duration = random.uniform(FIX_MIN, FIX_MAX)
+    fix_frames = seconds_to_frames(
+        requested_fix_duration, frame_counts["expected_rate"]
+    )
     present_static(win, kb, [fix_stim], fix_frames, presses)
 
     # --- 2) prime word alone, 600 ms ----------------------------------------
@@ -892,6 +934,7 @@ def main():
         "participant": "test001",
         "session": "001",
         "fullscreen": True,
+        "expected_refresh_hz": "60",
         "send_LSL_triggers": True,
         "parallel_port_address": "0x0378",
         "photodiode_square": True,
@@ -902,6 +945,7 @@ def main():
     }
     dlg = gui.DlgFromDict(exp_info, title="vMMR EEG experiment",
                           order=["participant", "session", "fullscreen",
+                                 "expected_refresh_hz",
                                  "send_LSL_triggers",
                                  "parallel_port_address",
                                  "photodiode_square",
@@ -915,6 +959,16 @@ def main():
     participant            = exp_info["participant"]
     session                = exp_info["session"]
     fullscreen             = bool(exp_info["fullscreen"])
+    try:
+        expected_refresh_hz = parse_expected_refresh_hz(
+            exp_info["expected_refresh_hz"]
+        )
+    except ValueError as exc:
+        error_dlg = gui.Dlg(title="Invalid refresh rate")
+        error_dlg.addText(str(exc))
+        error_dlg.show()
+        core.quit()
+        return
     send_eeg_triggers      = False
     send_lsl_triggers      = bool(exp_info["send_LSL_triggers"])
     use_photodiode_square  = bool(exp_info["photodiode_square"])
@@ -940,6 +994,9 @@ def main():
     trigger = None
     event_f = None
     trial_f = None
+    lsl_consumer_check_available = None
+    lsl_consumer_connected = None
+    run_exception = None
     try:
         # --- hardware: wait for Simulink before opening the screen (LSL mode) -
         if send_lsl_triggers:
@@ -949,9 +1006,29 @@ def main():
                 nominal_srate=lsl_nominal_srate,
             )
             print("LSL marker stream 'experiment_markers' created.", flush=True)
-            print("\nOutlet live. Start the Simulink model, "
-                  "then press Enter when ready...", flush=True)
-            input()
+            print("\nOutlet live. Start the Simulink model now.", flush=True)
+            lsl_consumer_connected = trigger.wait_for_consumers(timeout=15.0)
+            lsl_consumer_check_available = lsl_consumer_connected is not None
+            if lsl_consumer_connected is False:
+                message = (
+                    "No Simulink LSL inlet connected to 'experiment_markers' "
+                    "within 15 seconds. The run will stop before data collection."
+                )
+                print(message, flush=True)
+                raise RuntimeError(message)
+            if lsl_consumer_connected is None:
+                logging.warning(
+                    "This pylsl version cannot detect consumers automatically; "
+                    "using the manual Simulink confirmation workflow."
+                )
+                print(
+                    "Automatic LSL consumer detection is unavailable. Start the "
+                    "Simulink model, then press Enter when ready...",
+                    flush=True,
+                )
+                input()
+            else:
+                print("Simulink LSL inlet detected.", flush=True)
         else:
             trigger = EEGTrigger(enabled=send_eeg_triggers,
                                  address=exp_info["parallel_port_address"])
@@ -966,40 +1043,108 @@ def main():
         kb = keyboard.Keyboard()
 
         # --- measure the refresh rate and convert durations to frames --------
-        frame_rate = win.getActualFrameRate(nIdentical=60, nMaxFrames=180,
-                                            nWarmUpFrames=10, threshold=1)
-        if frame_rate is None:
-            frame_rate = 60.0
-            logging.warning("Could not measure refresh rate; assuming 60 Hz.")
-        win.refreshThreshold = (1.0 / frame_rate) * 1.2   # dropped-frame flag
+        measured_refresh_hz = win.getActualFrameRate(
+            nIdentical=60, nMaxFrames=180, nWarmUpFrames=10, threshold=1
+        )
+        refresh_diagnostics = refresh_rate_diagnostics(
+            expected_refresh_hz, measured_refresh_hz
+        )
+        if not refresh_diagnostics["measurement_successful"]:
+            logging.warning(
+                "Could not measure monitor refresh rate; using configured "
+                f"expected_refresh_hz={expected_refresh_hz:g} for frame "
+                "conversion and dropped-frame diagnostics."
+            )
+        elif not refresh_diagnostics["matches_expected"]:
+            message = (
+                "Monitor refresh-rate mismatch. "
+                f"Expected {expected_refresh_hz:.3f} Hz but PsychoPy measured "
+                f"{measured_refresh_hz:.3f} Hz (allowed difference: 2%). "
+                "The run will stop before practice or experimental trials."
+            )
+            logging.error(message)
+            print(message, flush=True)
+            error_dlg = gui.Dlg(title="Refresh-rate mismatch")
+            error_dlg.addText(message)
+            error_dlg.show()
+            raise RuntimeError(message)
 
-        def n_frames(seconds):
-            return max(1, int(round(seconds * frame_rate)))
+        threshold_rate = refresh_diagnostics["threshold_rate_hz"]
+        win.refreshThreshold = (1.0 / threshold_rate) * 1.2
+
+        frame_duration_seconds = {
+            "fix_min": FIX_MIN,
+            "fix_max": FIX_MAX,
+            "prime": PRIME_DUR,
+            "pre_face": PRE_FACE_FIX_DUR,
+            "face_on": FACE_ON_DUR,
+            "blank": FACE_BLANK_DUR,
+            "face_soa": FACE_ON_DUR + FACE_BLANK_DUR,
+            "post_seq": POST_SEQUENCE_DUR,
+            "photodiode_initial_black": PHOTODIODE_TEST_INITIAL_BLACK_DUR,
+            "lsl_buffer_initial_black": LSL_BUFFER_TEST_INITIAL_BLACK_DUR,
+            "lsl_buffer_on": LSL_BUFFER_TEST_ON_DUR,
+            "lsl_buffer_off": LSL_BUFFER_TEST_OFF_DUR,
+        }
 
         frame_counts = {
-            "rate":     frame_rate,
-            "prime":    n_frames(PRIME_DUR),
-            "pre_face": n_frames(PRE_FACE_FIX_DUR),
-            "face_on":  n_frames(FACE_ON_DUR),
-            "blank":    n_frames(FACE_BLANK_DUR),
-            "post_seq": n_frames(POST_SEQUENCE_DUR),
-            "lsl_buffer_initial_black": n_frames(
-                LSL_BUFFER_TEST_INITIAL_BLACK_DUR),
-            "lsl_buffer_on": n_frames(LSL_BUFFER_TEST_ON_DUR),
-            "lsl_buffer_off": n_frames(LSL_BUFFER_TEST_OFF_DUR),
+            "expected_rate": expected_refresh_hz,
+            "measured_rate": measured_refresh_hz,
+            # Compatibility alias: all frame loops use the expected rate.
+            "rate": expected_refresh_hz,
         }
+        frame_counts.update({
+            name: seconds_to_frames(seconds, expected_refresh_hz)
+            for name, seconds in frame_duration_seconds.items()
+        })
+        if (frame_counts["face_on"] + frame_counts["blank"]
+                != frame_counts["face_soa"]):
+            raise RuntimeError(
+                "Face timing invariant failed: face_on frames + blank frames "
+                "must equal the 600 ms face SOA."
+            )
 
         # --- run-info diagnostics file --------------------------------------
         with open(str(base) + "_run_info.txt", "w", encoding="utf-8") as f:
             f.write(f"participant: {participant}\nsession: {session}\n")
             f.write(f"timestamp: {stamp}\n")
-            f.write(f"frame_rate_measured: {frame_rate}\n")
-            for k, v in frame_counts.items():
-                f.write(f"frames[{k}]: {v}\n")
+            f.write(f"expected_refresh_hz: {expected_refresh_hz}\n")
+            f.write(f"measured_refresh_hz: {measured_refresh_hz}\n")
+            f.write(
+                "refresh_measurement_successful: "
+                f"{str(refresh_diagnostics['measurement_successful']).lower()}\n"
+            )
+            f.write(
+                "refresh_rate_difference_hz: "
+                f"{refresh_diagnostics['difference_hz']}\n"
+            )
+            f.write(
+                "refresh_rate_difference_percent: "
+                f"{refresh_diagnostics['difference_percent']}\n"
+            )
+            f.write(f"dropped_frame_threshold_seconds: {win.refreshThreshold}\n")
+            for name, intended_seconds in frame_duration_seconds.items():
+                frames = frame_counts[name]
+                f.write(f"frames[{name}]: {frames}\n")
+                f.write(f"intended_duration_seconds[{name}]: {intended_seconds}\n")
+                f.write(
+                    f"realized_duration_seconds[{name}]: "
+                    f"{frames / expected_refresh_hz}\n"
+                )
             f.write(f"send_EEG_triggers: {send_eeg_triggers}\n")
             f.write(f"send_LSL_triggers: {send_lsl_triggers}\n")
             f.write(f"lsl_keepalive_hz: {lsl_keepalive_hz}\n")
             f.write(f"lsl_nominal_srate: {lsl_nominal_srate}\n")
+            f.write(f"lsl_hold_duration: {getattr(trigger, 'hold_duration', None)}\n")
+            f.write(
+                "trigger_requires_manual_clear: "
+                f"{getattr(trigger, 'requires_manual_clear', False)}\n"
+            )
+            f.write(
+                "lsl_consumer_check_available: "
+                f"{lsl_consumer_check_available}\n"
+            )
+            f.write(f"lsl_consumer_connected: {lsl_consumer_connected}\n")
             f.write(f"parallel_port_address: {exp_info['parallel_port_address']}\n")
             f.write(f"photodiode_square: {use_photodiode_square}\n")
             f.write(f"photodiode_square_enabled: {use_photodiode_square}\n")
@@ -1153,26 +1298,33 @@ def main():
         show_text_and_wait(win, kb, instruction_text,
             "The experiment is complete.\n\nThank you.\n\n"
             "Press SPACE to exit.")
-        # Send experiment end trigger
-        if trigger is not None:
-            trigger.set(99)
-
     except KeyboardInterrupt as e:
+        run_exception = e
         logging.warning(f"Run ended early: {e}")
-        # Send abort trigger
-        if trigger is not None and not lsl_buffer_test_mode:
-            trigger.set(99)
     except Exception as e:
+        run_exception = e
         # Log the full traceback so an unexpected crash is diagnosable.
         logging.error(f"Unexpected error: {e}\n{traceback.format_exc()}")
-        # Send error/abort trigger
-        if trigger is not None and not lsl_buffer_test_mode:
-            trigger.set(99)
     finally:
         if trigger is not None:
-            trigger.clear()
-            if hasattr(trigger, "stop"):
-                trigger.stop()
+            try:
+                if isinstance(trigger, LSLTrigger):
+                    # finish() keeps marker 99 latched for hold_duration, then
+                    # pushes zero and joins the keepalive thread exactly once.
+                    trigger.finish(final_code=99)
+                else:
+                    # Preserve pulse-style parallel-port shutdown behavior.
+                    trigger.set(99)
+                    if getattr(trigger, "requires_manual_clear", False):
+                        trigger.clear()
+                    if hasattr(trigger, "stop"):
+                        trigger.stop()
+            except Exception as shutdown_error:
+                logging.error(
+                    "Trigger shutdown failed after run error "
+                    f"{run_exception!r}: {shutdown_error}\n"
+                    f"{traceback.format_exc()}"
+                )
         if win is not None:
             write_frame_intervals(win, str(base) + "_frame_intervals.csv")
             win.close()
