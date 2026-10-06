@@ -33,9 +33,17 @@
 #   *.log                   PsychoPy log
 # =============================================================================
 
-from psychopy import visual, core, gui, logging
-from psychopy import event as psychopy_event
-from psychopy.hardware import keyboard
+import importlib
+
+# PsychoPy is installed in the experiment runtime, but may not be installed
+# in the editor's Python environment. Dynamic imports keep static analysis
+# from flagging the runtime dependency while retaining the usual module names.
+visual = importlib.import_module("psychopy.visual")
+core = importlib.import_module("psychopy.core")
+gui = importlib.import_module("psychopy.gui")
+logging = importlib.import_module("psychopy.logging")
+psychopy_event = importlib.import_module("psychopy.event")
+keyboard = importlib.import_module("psychopy.hardware.keyboard")
 
 from pathlib import Path
 from datetime import datetime
@@ -43,8 +51,14 @@ import traceback
 import random
 import csv
 
-from pylsl import local_clock
 from lsl_trigger import LSLTrigger
+
+try:
+    # pylsl is optional when LSL output is disabled. Import it dynamically so
+    # environments without pylsl can still run the script.
+    local_clock = importlib.import_module("pylsl").local_clock
+except (ImportError, AttributeError):
+    local_clock = None
 
 # =============================================================================
 # 1. CONSTANTS
@@ -128,7 +142,7 @@ def make_push(trigger, code, store):
     store['cb'] = local_clock() when the callback started
     store['lsl'] = LSL timestamp taken inside LSLTrigger (after the lock)"""
     def _push():
-        store["cb"] = local_clock()
+        store["cb"] = local_clock() if local_clock is not None else None
         store["lsl"] = trigger.set_with_timestamp(code)
     return _push
 
@@ -379,11 +393,12 @@ def main():
         logging.error(f"Unexpected error: {e}\n{traceback.format_exc()}")
     finally:
         if trigger is not None:
-            # End code, held long enough to be recorded, then shut down.
-            trigger.set(END_MARKER)
-            core.wait(getattr(trigger, "hold_duration", 0.1) + 0.05)
-            trigger.clear()
-            trigger.stop()
+            # Latch END_MARKER for hold_duration, return to 0, stop once.
+            # Guarded so a stuck keepalive thread cannot skip the file saves.
+            try:
+                trigger.finish(final_code=END_MARKER)
+            except Exception as e:
+                logging.error(f"LSL shutdown problem: {e}")
         if win is not None:
             with open(str(base) + "_frame_intervals.csv", "w",
                       encoding="utf-8", newline="") as f:

@@ -25,11 +25,11 @@ transient. Let hold_duration handle the return to 0.
 """
 
 import threading
-from pylsl import StreamInfo, StreamOutlet, local_clock
+from importlib import import_module
 
 _STREAM_NAME   = 'experiment_markers'
-_KEEPALIVE_HZ  = 1200
-_NOMINAL_SRATE = 1200
+_KEEPALIVE_HZ  = 1200.0
+_NOMINAL_SRATE = 1200.0
 _HOLD_DURATION = 0.100   # 0 < consumer_period << hold << min_event_gap
 
 
@@ -58,6 +58,19 @@ class LSLTrigger:
 
         if not self.enabled:
             return
+
+        # pylsl is optional when LSL output is disabled. Import it lazily so
+        # importing this module does not fail in installations without pylsl.
+        try:
+            pylsl = import_module('pylsl')
+            stream_info = pylsl.StreamInfo
+            stream_outlet = pylsl.StreamOutlet
+            self._local_clock = pylsl.local_clock
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "LSL output requires the optional 'pylsl' package."
+            ) from exc
+
         self.keepalive_hz  = float(keepalive_hz)
         self.nominal_srate = float(nominal_srate)
         if self.keepalive_hz <= 0:
@@ -67,10 +80,10 @@ class LSLTrigger:
         if self.hold_duration <= 0:
             raise ValueError("hold_duration must be positive.")
 
-        info = StreamInfo(name=stream_name, type='Markers', channel_count=1,
-                          nominal_srate=self.nominal_srate,
-                          channel_format='int32', source_id=source_id)
-        self.outlet = StreamOutlet(info)
+        info = stream_info(name=stream_name, type='Markers', channel_count=1,
+                   nominal_srate=self.nominal_srate,
+                   channel_format='int32', source_id=source_id)
+        self.outlet = stream_outlet(info)
         self._start_keepalive()
 
     # ------------------------------------------------------------------
@@ -82,12 +95,15 @@ class LSLTrigger:
 
     def _keepalive(self):
         interval = 1.0 / self.keepalive_hz
+        outlet = self.outlet
+        if outlet is None:
+            return
         while not self._stop_event.is_set():
             with self._lock:
-                if self._expiry is not None and local_clock() >= self._expiry:
+                if self._expiry is not None and self._local_clock() >= self._expiry:
                     self._current_value = 0
                     self._expiry = None
-                self.outlet.push_sample([self._current_value], pushthrough=True)
+                outlet.push_sample([self._current_value], pushthrough=True)
             self._stop_event.wait(interval)
 
     def set_with_timestamp(self, code):
@@ -95,7 +111,7 @@ class LSLTrigger:
             return None
         value = int(code)
         with self._lock:
-            timestamp = local_clock()
+            timestamp = self._local_clock()
             self._current_value = value
             self._expiry = timestamp + self.hold_duration
             self.outlet.push_sample(
