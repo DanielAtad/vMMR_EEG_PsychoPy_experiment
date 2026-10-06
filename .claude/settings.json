@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(unzip -p HIamp_record_LSL_DD_vMMR.slx simulink/systems/system_root.xml)",
+      "Bash(unzip -p HIamp_record_LSL_DD_photodiode_delay_test.slx simulink/systems/system_root.xml)",
+      "Bash(unzip -p HIamp_record_LSL_DD_vMMR.slx simulink/bddefaults.xml)"
+    ]
+  }
+}
