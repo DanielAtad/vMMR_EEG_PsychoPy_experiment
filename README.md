@@ -644,6 +644,40 @@ Keep notes in this README or in a separate changelog:
 CHANGELOG.md
 ```
 
+### v1: LSL outlet after the refresh-rate measurement (2026-10-08)
+
+```text
+run_vMMR_experiment_v1_trig_after_framerate_measurement.py
+run_photodiode_latency_v1_trig_after_framerate_measurement.py
+```
+
+Photodiode latency runs with LSL timestamps (`notebooks/photodiode_latency_compare.ipynb`)
+showed that the first flips of the new fullscreen window (start of `getActualFrameRate`)
+pause PsychoPy for about 0.8 s. In v0 the LSL outlet already existed at that point, so
+the marker stream paused too. The Simulink model takes one LSL sample per step, so it
+stalled and never caught up (`lsl_trigger.py` resyncs after pauses > 0.1 s instead of
+sending the missed samples): all EEG data lagged the markers by about 0.8 s for the whole
+run, and every v0 `*_run_info.txt` shows `lsl_resyncs: 1`.
+
+Changes in v1:
+
+* The window is opened and the refresh rate measured **before** the LSL outlet is created.
+* The "start the Simulink model" prompt is shown on the stimulus screen instead of the
+  console (the fullscreen window covers the console). The latency test waits for SPACE;
+  the experiment waits for the Simulink inlet to connect, as before.
+* `expected_refresh_hz` defaults to `59.94`, the measured rate of the stimulus display
+  (`timing_utils.py` now also accepts 59.94 and 119.88). Frame counts are the same as at
+  60 Hz; logged durations are now exact.
+* The experiment's `*_run_info.txt` ends with `lsl_samples_sent`, `lsl_seconds`,
+  `lsl_rate_hz` and `lsl_resyncs`. `lsl_resyncs` should be `0`.
+
+Trial structure, frame timing, trigger codes and output schema are unchanged.
+
+`run_photodiode_latency_v2_trig_after_space_input.py` goes one step further for the
+latency test: the LSL outlet is created only after SPACE on the sensor-alignment screen
+(order: window → refresh measurement → alignment screen → LSL outlet → "start Simulink"
+screen → START marker 9 → baseline → calibration → flashes).
+
 ## Minimal pre-data-collection checklist
 
 Before collecting real EEG data:
