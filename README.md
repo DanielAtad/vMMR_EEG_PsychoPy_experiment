@@ -678,6 +678,31 @@ latency test: the LSL outlet is created only after SPACE on the sensor-alignment
 (order: window → refresh measurement → alignment screen → LSL outlet → "start Simulink"
 screen → START marker 9 → baseline → calibration → flashes).
 
+From 2026-10-13 all three latency scripts (v0, v1, v2) show an **experiment-start screen**
+after the sensor-alignment screen. SPACE there sends marker **1** (experiment start) on the
+next flip; the baseline, calibration (5/6/5) and flashes follow, so the calibration
+timeline is counted from marker 1. `notebooks/photodiode_latency_compare.ipynb` ignores
+everything before marker 1 when it is present (file-name tag `expstart`).
+
+### Calibration database (`run_photodiode_latency_database.py`)
+
+The final configuration for building the marker-timing correction database: v1 start-up
+order, experiment-start marker 1, LSL 600 Hz, `expected_refresh_hz` 59.94, Simulink frame
+length 8, square and optical sensor always at the **screen centre** (where faces and primes
+appear; the sensor is not moved during the database). Dialog choices: `run_type` (`short` =
+100 flashes, `long` = 500 flashes with the width ramp repeating every 100), operator, cold
+start, notes. The run number increments per day and the
+"start Simulink" screen shows the exact EEG file names to enter in both `To File` blocks
+(`photodiode_db_<date>_<run>_slx_frame_length_8_timestamped_LSL_trig_after_framerate_expstart_sq<position>_<type>.mat`
+and `..._LSLtiming.mat`). `run_info` records software versions, the git commit and SHA-256
+hashes of the script and `lsl_trigger.py`; every run is appended to `data/database_run_log.csv`.
+Commit all changes before database runs so `git_tracked_changes: no` is recorded.
+
+The Simulink model used on the recording computer (with the `LSLMarkerTimestamps` block)
+is in `matlab/on_eeg_computer/` (`HIamp_record_LSL_DD_vMMR.slx`, `LSLMarkerTimestamps.m`;
+R2020a, liblsl-Matlab required). The protocol for the two database days is in
+`docs/calibration_database_plan_2026-10.docx`.
+
 ## Minimal pre-data-collection checklist
 
 Before collecting real EEG data:
