@@ -2,6 +2,11 @@
 # =============================================================================
 # Minimal PsychoPy-trigger -> photodiode latency/jitter test for the vMMR rig.
 #
+# CHANGE (2026-10-14): dialog field on_cycle. If > 0, the flash-duration ramp
+# repeats every on_cycle flashes: flash i lasts
+# ON_START + ((i-1) mod on_cycle) * ON_STEP (as in the database script, which
+# uses 100). on_cycle = 0 (default) keeps the old, ever-increasing ramp.
+#
 # CHANGE (2026-10-13): experiment-start screen after the sensor-alignment
 # screen. SPACE there sends EXP_START_MARKER (1) on the next flip (first black
 # frame); the black baseline, calibration (5/6/5) and flash block follow from
@@ -20,12 +25,12 @@
 # Expected with v1: lsl_resyncs: 0 in *_run_info.txt and no backlog.
 # Marker codes, timing and outputs are unchanged.
 #
-# One condition only: full-white square in the bottom-right corner (same place
-# as the real task's photodiode square), LSL marker pushed on the onset flip via
-# win.callOnFlip, repeated N times.
+# One condition only: full-white square in the screen centre (moved 2026-10-14),
+# LSL marker pushed on the onset flip via win.callOnFlip, repeated N times.
 #
 # DURATION CODING: every flash has its own duration. Flash i keeps the square
-# on for ON_START + (i-1)*ON_STEP (rounded to whole frames), and its marker is
+# on for ON_START + k*ON_STEP, k = (i-1) mod on_cycle if on_cycle > 0, else
+# k = i-1 (rounded to whole frames), and its marker is
 # held for the same time. In the recording, the WIDTH of a photodiode pulse
 # therefore tells which flash it is, so each marker can be paired with its own
 # photodiode pulse even if the two channels are offset or stretched in time.
@@ -340,6 +345,7 @@ def main():
         "n_flashes": N_FLASHES_DEFAULT,
         "on_start_ms": ON_START_MS,
         "on_step_ms": ON_STEP_MS,
+        "on_cycle": 0,
         "square_size_px": DIODE_SIZE_DEFAULT,
         "rng_seed": 20261006,
         "lsl_keepalive_hz": 600,
@@ -359,6 +365,7 @@ def main():
     n_flashes   = to_int(info["n_flashes"], N_FLASHES_DEFAULT)
     on_start_ms = to_float(info["on_start_ms"], ON_START_MS)
     on_step_ms  = to_float(info["on_step_ms"], ON_STEP_MS)
+    on_cycle    = to_int(info["on_cycle"], 0)
     square_size = to_int(info["square_size_px"], DIODE_SIZE_DEFAULT)
     rng_seed    = to_int(info["rng_seed"], 20261006)
     keepalive   = to_float(info["lsl_keepalive_hz"], 600.0)
@@ -368,6 +375,10 @@ def main():
         raise ValueError("n_flashes, square_size_px, expected_refresh_hz must be > 0.")
     if on_start_ms <= 0 or on_step_ms <= 0:
         raise ValueError("on_start_ms and on_step_ms must be > 0.")
+    if on_cycle < 0:
+        raise ValueError("on_cycle must be >= 0 (0 = no repeat).")
+    # ramp step of the longest flash actually shown
+    k_max = (min(n_flashes, on_cycle) if on_cycle > 0 else n_flashes) - 1
 
     rng = random.Random(rng_seed)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -449,14 +460,15 @@ def main():
                 f.write(f"frames[{k}]: {v}\n")
             f.write(f"square_center_px: ({x:.1f}, {y:.1f})\n")
             f.write(f"square_margin_px: {DIODE_MARGIN}\n")
-            f.write("flash i: on_frames = frames[on_start] + (i-1)*frames[on_step]; "
+            f.write("flash i: on_frames = frames[on_start] + k*frames[on_step], "
+                    "k = (i-1) mod on_cycle if on_cycle > 0 else i-1; "
                     "marker held for the same duration\n")
             f.write(f"on_duration_first_ms: "
                     f"{frame_counts['on_start'] / expected_hz * 1000:.2f}\n")
             f.write(f"on_duration_step_ms: "
                     f"{frame_counts['on_step'] / expected_hz * 1000:.2f}\n")
             f.write(f"on_duration_last_ms: "
-                    f"{(frame_counts['on_start'] + (n_flashes - 1) * frame_counts['on_step']) / expected_hz * 1000:.2f}\n")
+                    f"{(frame_counts['on_start'] + k_max * frame_counts['on_step']) / expected_hz * 1000:.2f}\n")
             f.write(f"off_range_s: [{OFF_MIN}, {OFF_MAX}]\n")
             f.write(f"lsl_hold_duration_s: {getattr(trigger, 'hold_duration', None)}\n")
             f.write("markers: start=9 (not flip-aligned), "
@@ -492,7 +504,8 @@ def main():
         win.recordFrameIntervals = True
         for i in range(1, n_flashes + 1):
             off_n = rng.randint(frame_counts["off_min"], frame_counts["off_max"])
-            on_n = frame_counts["on_start"] + (i - 1) * frame_counts["on_step"]
+            k = (i - 1) % on_cycle if on_cycle > 0 else (i - 1)
+            on_n = frame_counts["on_start"] + k * frame_counts["on_step"]
             on_s = on_n / expected_hz
             row = run_flash(win, kb, trigger, square, on_n, off_n, on_s)
             row.update({"flash_index": i, "marker_code": FLASH_MARKER,
