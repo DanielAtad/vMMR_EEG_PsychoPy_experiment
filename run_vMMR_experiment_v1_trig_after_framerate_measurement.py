@@ -954,8 +954,8 @@ def main():
         "photodiode_square": True,
         "photodiode_test_mode": False,
         "lsl_buffer_test_mode": False,
-        "lsl_keepalive_hz": 1200,
-        "lsl_nominal_srate": 1200,
+        "lsl_keepalive_hz": 600,
+        "lsl_nominal_srate": 600,
     }
     dlg = gui.DlgFromDict(exp_info, title="vMMR EEG experiment",
                           order=["participant", "session", "fullscreen",
@@ -989,9 +989,9 @@ def main():
     photodiode_test_mode   = bool(exp_info["photodiode_test_mode"])
     lsl_buffer_test_mode   = bool(exp_info["lsl_buffer_test_mode"])
     lsl_keepalive_hz       = to_float(exp_info["lsl_keepalive_hz"],
-                                      default=1200.0)
+                                      default=600.0)
     lsl_nominal_srate      = to_float(exp_info["lsl_nominal_srate"],
-                                      default=1200.0)
+                                      default=600.0)
     if lsl_keepalive_hz <= 0:
         raise ValueError("lsl_keepalive_hz must be positive.")
     if lsl_nominal_srate <= 0:
