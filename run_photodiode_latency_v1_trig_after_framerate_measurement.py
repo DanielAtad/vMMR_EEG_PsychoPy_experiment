@@ -196,7 +196,7 @@ def alignment_screen(win, kb, square, text_stim, preview_on_n, preview_off_n):
     """Blink the square until SPACE so the operator can place the sensor and
     confirm the g.TRIGbox LED follows every ON and OFF. No markers are sent."""
     text_stim.text = (
-        "Place the optical sensor on the blinking square (bottom-right).\n\n"
+        "Place the optical sensor on the blinking square (centre).\n\n"
         "Check that the g.TRIGbox LED turns ON with every white square\n"
         "and OFF with every black gap.\n\n"
         "SPACE = continue      ESC = abort"
@@ -417,12 +417,12 @@ def main():
             "preview_off": n_frames(PREVIEW_OFF),
         }
 
-        x, y = diode_xy(win, square_size, DIODE_MARGIN)
+        x, y = 0.0, 0.0  # square at the screen centre
         scalar = luminance_to_scalar(DIODE_LUMINANCE)
         square = visual.Rect(win, width=square_size, height=square_size,
                              pos=(x, y), units="pix",
                              fillColor=scalar, lineColor=scalar)
-        text_stim = visual.TextStim(win, text="", pos=(0, 0), height=28,
+        text_stim = visual.TextStim(win, text="", pos=(0, 320), height=28,
                                     color="white", units="pix", wrapWidth=1000)
 
         # --- LSL outlet (after the window); start Simulink AFTER it exists --
