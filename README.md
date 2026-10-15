@@ -703,6 +703,50 @@ is in `matlab/on_eeg_computer/` (`HIamp_record_LSL_DD_vMMR.slx`, `LSLMarkerTimes
 R2020a, liblsl-Matlab required). The protocol for the two database days is in
 `docs/calibration_database_plan_2026-10.docx`.
 
+In the end the database (14–15 October 2026) was recorded with
+`run_photodiode_latency_v1_trig_after_framerate_measurement.py` (centre square since commit
+`0cc537d`; `on_cycle` 100 for long runs), not with the database script; see below.
+
+## Marker timing correction (calibrated 2026-10-15)
+
+Every event time used in EEG analysis must be corrected:
+
+```text
+event onset (EEG model time) = t_B + offset_BA − B + 62.4 ms
+```
+
+`t_B` is the LSL send timestamp (computer B), `offset_BA` LSL's clock offset, and `B` the
+90th percentile of `t_A − model time` within ±10 s of the event (computer A's LSL clock
+against the amplifier sample clock). All three come from the `LSLMarkerTimestamps` block,
+saved by the recording model as `<recording>_LSLtiming.mat`. **Do not use the marker channel
+of `EEG_data` (g.HIsys LSL Receive) for event timing**: it varies by ~9 ms between sessions.
+
+* Correction: **62.4 ms** (95 % CI 61.7–63.0; between-session SD 1.4 ms; a new session is
+  expected within 59.4–65.3 ms). Per event: SD 5.7 ms, all within one display frame.
+  Valid for stimuli at the screen centre (bottom-right corner: +2.0 ms).
+* Code: `analysis/marker_timing.py`
+
+  ```python
+  import sys; sys.path.insert(0, "analysis")
+  from marker_timing import correct_events, to_mne_events
+  events, qc = correct_events("recording.mat", run_info="..._run_info.txt")
+  assert qc["passed"], qc["problems"]          # lsl_resyncs 0, no lasting backlog
+  mne_events = to_mne_events(events, codes=[11, 12, 21, 22, 31, 32, 41, 42])
+  ```
+
+  or `.venv/Scripts/python analysis/marker_timing.py recording.mat --run-info ..._run_info.txt`
+  (writes `recording_events_corrected.csv`). Reading the `.mat` files needs `h5py`.
+* Calibration analysis: `analysis/calibration_database_analysis.py` (reproduces every number
+  and figure of the supplement from `data/EEG/final database/`: `EEG_Computer_A/`,
+  `Computer_B/`, `run_manifest.csv`; outputs in `data/analysis/calibration_database/`).
+* Methods: `docs/supplement_marker_timing_calibration_2026-10-15.docx`; lab guide (settings and
+  scripts on both computers): `docs/lab_guide_marker_timing_2026-10.docx`; open work:
+  `docs/todo_experiment_and_analysis_2026-10.docx`.
+* The constant is tied to the locked configuration (display 59.94 Hz, LSL 600 Hz, g.HIamp
+  600 Hz frame length 8, v1 sender, model in `matlab/on_eeg_computer/`). After any change to
+  hardware, drivers, display settings, PsychoPy, `lsl_trigger.py` or the model, record at
+  least 3 calibration sessions and compare them with the database.
+
 ## Minimal pre-data-collection checklist
 
 Before collecting real EEG data:
