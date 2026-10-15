@@ -159,6 +159,33 @@ para("Optical validation of Lab Streaming Layer (LSL) event markers recorded wit
 para(f"Calibration data recorded 14–15 October 2026 (pilot 6–13 October 2026). Code and analysis: {REPO_URL} "
      "(branch `photodiode-latency-calibration`, commit [to be inserted at submission]).", size=9, space_after=10)
 
+# ----------------------------------------------------------------------------- to complete (remove before submission)
+todo = doc.add_table(rows=1, cols=1)
+todo.style = "Table Grid"
+cell = todo.rows[0].cells[0]
+cell.width = Inches(6.7)
+shade(cell, "FFF4CE")
+cell.text = ""
+add_runs(cell.paragraphs[0], "TO COMPLETE BEFORE SUBMISSION (delete this box)", bold=True, size=10)
+for item in [
+    "Title block: the commit hash of the code version used (e.g. the release commit of branch "
+    "`photodiode-latency-calibration`).",
+    "Table S1, recording computer (A): g.HIamp model and channel count, g.HIsys version, liblsl-Matlab version, "
+    "Windows version (and CPU if wanted).",
+    "Table S1, network: confirm the connection between A and B (currently “local Ethernet”).",
+    "S1.6: confirm per study that hardware, software and display settings were unchanged between calibration and "
+    "data collection, or report the re-calibration sessions.",
+    "Data and code availability: where the raw recordings are deposited (repository/DOI or Google Drive link) and "
+    "the access conditions.",
+    "References: replace the Kothe et al. (2024) bioRxiv entry with its final citation if published, and check all "
+    "DOIs against the journal's reference style.",
+    "Numbering: adapt “Supplementary Material S1” and the S-numbers of tables and figures to the journal's scheme.",
+]:
+    p = cell.add_paragraph(style="List Bullet")
+    add_runs(p, item, size=9)
+    p.paragraph_format.space_after = Pt(1)
+para("", space_after=6)
+
 # ----------------------------------------------------------------------------- abstract
 h("Summary", 1)
 para(f"Event markers in this study are sent by the stimulus computer over the Lab Streaming Layer (LSL) and "
